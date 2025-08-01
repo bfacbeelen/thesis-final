@@ -1,0 +1,1328 @@
+---
+title: "Thesis - Bente Beelen"
+output: html_document
+date: "2025-07-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load required libraries
+library(tidyverse)
+library(caret)
+library(e1071)
+library(randomForest)
+library(xgboost)
+library(glmnet)
+library(gbm)
+library(corrplot)
+library(VIM)
+library(mice)
+library(ggplot2)
+library(plotly)
+library(fastDummies)
+library(recipes)
+library(ranger)
+library(lightgbm)
+library(h2o)
+library(DALEX)
+library(shapviz)
+library(shapper)
+library(MASS)
+library(car)
+library(PerformanceAnalytics)
+library(SHAPforxgboost)
+library(iml)
+library(dplyr)
+```
+
+
+## Evalution Function
+
+```{r}
+# Evaluation function
+evaluate_model <- function(actual, predicted) {
+  mae <- mean(abs(actual - predicted))
+  rmse <- sqrt(mean((actual - predicted)^2))
+  r2 <- 1 - sum((actual - predicted)^2) / sum((actual - mean(actual))^2)
+  mape <- mean(abs((actual - predicted) / actual)) * 100
+  
+  # Additional metrics
+  median_ae <- median(abs(actual - predicted))
+  max_error <- max(abs(actual - predicted))
+  
+  return(list(
+    MAE = round(mae, 3),
+    RMSE = round(rmse, 3),
+    R2 = round(r2, 4),
+    MAPE = round(mape, 2),
+    MedianAE = round(median_ae, 3),
+    MaxError = round(max_error, 3)
+  ))
+}
+
+# Cross-validation function
+perform_cv <- function(model_func, data, folds = 5, ...) {
+  set.seed(311441)
+  cv_folds <- createFolds(data$Purchase.Amount..USD., k = folds)
+  cv_results <- list()
+  
+  for(i in 1:folds) {
+    train_cv <- data[-cv_folds[[i]], ]
+    test_cv <- data[cv_folds[[i]], ]
+    
+    tryCatch({
+      model <- model_func(train_cv, ...)
+      if(class(model)[1] == "xgb.Booster") {
+        test_matrix <- model.matrix(Purchase.Amount..USD. ~ . -1, data = test_cv)
+        preds <- predict(model, newdata = test_matrix)
+      } else {
+        preds <- predict(model, newdata = test_cv)
+      }
+      
+      cv_results[[i]] <- evaluate_model(test_cv$Purchase.Amount..USD., preds)
+    }, error = function(e) {
+      cat("Error in fold", i, ":", e$message, "\n")
+      cv_results[[i]] <- NULL
+    })
+  }
+  
+  # Remove NULL results
+  cv_results <- cv_results[!sapply(cv_results, is.null)]
+  
+  if (length(cv_results) == 0) {
+    return(NULL)
+  }
+  
+  # Average results
+  avg_results <- list(
+    MAE = mean(sapply(cv_results, function(x) x$MAE)),
+    RMSE = mean(sapply(cv_results, function(x) x$RMSE)),
+    R2 = mean(sapply(cv_results, function(x) x$R2)),
+    MAPE = mean(sapply(cv_results, function(x) x$MAPE))
+  )
+  
+  return(avg_results)
+}
+```
+
+
+## Prepare Model Data
+
+```{r}
+# Load data
+set.seed(311441)
+data <- read.csv("/Users/bentebeelen/documents/shopping_behavior_updated.csv", stringsAsFactors = FALSE)
+
+# Data exploration
+cat("Dataset dimensions:", dim(data), "\n")
+cat("\nData structure:\n")
+str(data)
+
+# Check for missing values
+missing_summary <- data.frame(
+  Column = names(data),
+  Missing_Count = colSums(is.na(data)),
+  Missing_Percent = round(colSums(is.na(data)) / nrow(data) * 100, 2)
+)
+cat("\nMissing values summary:\n")
+print(missing_summary[missing_summary$Missing_Count > 0, ])
+
+# Target variable analysis
+cat("\nTarget variable (Purchase Amount) statistics:\n")
+summary(data$Purchase.Amount..USD.)
+
+# Visualize target distribution
+par(mfrow = c(2, 2))
+hist(data$Purchase.Amount..USD., breaks = 50, main = "Purchase Amount Distribution", 
+     xlab = "Purchase Amount (USD)", col = "lightblue")
+boxplot(data$Purchase.Amount..USD., main = "Purchase Amount Boxplot", 
+        ylab = "Purchase Amount (USD)", col = "skyblue3")
+qqnorm(data$Purchase.Amount..USD., main = "Q-Q Plot of Purchase Amount")
+qqline(data$Purchase.Amount..USD.)
+plot(density(data$Purchase.Amount..USD.), main = "Density Plot of Purchase Amount", 
+     xlab = "Purchase Amount (USD)", col = "skyblue4", lwd = 2)
+par(mfrow = c(1, 1))
+
+# Prep: Add log_purchase before mutating
+data$log_purchase <- log(data$Purchase.Amount..USD.)
+
+# 1: Prepare model_data with conversions
+model_data <- data %>%
+  mutate(
+    Discount.Applied = as.numeric(as.factor(Discount.Applied)),
+    Promo.Code.Used = as.numeric(as.factor(Promo.Code.Used)),
+    Shipping.Type = as.factor(Shipping.Type),  # KEEP factor for interactions
+    Gender_numeric = as.numeric(as.factor(Gender)),
+    Age = as.numeric(Age),
+    Previous.Purchases = as.numeric(Previous.Purchases),
+    log_purchase = as.numeric(log_purchase)    # now this works!
+  )
+```
+
+
+## Correlation Plot
+
+```{r}
+# --- Correlation Plot ---
+
+# 2. Prepare input matrix for XGBoost
+x_df <- model_data %>%
+  dplyr::select(-log_purchase) %>%
+  model.matrix(~ . - 1, data = .) %>%
+  as.data.frame()
+
+# 3. Define target variable
+y <- model_data$log_purchase
+
+# 4. CORRELATION PLOT SETUP ---------------------------------------
+
+# Select relevant variables for correlation
+corr_data <- model_data %>%
+  dplyr::select(log_purchase, Previous.Purchases, Age, Gender_numeric, Discount.Applied, Promo.Code.Used) %>%
+  mutate(across(everything(), ~ as.numeric(as.character(.)))) %>%
+  na.omit()
+
+# Rename target for clarity in plot
+colnames(corr_data)[colnames(corr_data) == "log_purchase"] <- "Log_Purchase"
+
+# Install and load 'corrplot' if needed
+if (!require(corrplot)) install.packages("corrplot")
+library(corrplot)
+
+# Compute correlation matrix
+cor_matrix <- cor(corr_data)
+
+# Plot with pink/blue palette
+corrplot(
+  cor_matrix,
+  method = "color",
+  col = colorRampPalette(c("lightblue", "white", "pink"))(200),
+  type = "upper",
+  order = "hclust",
+  addCoef.col = "black",
+  tl.col = "skyblue4",
+  tl.srt = 45,
+  number.cex = 0.8,
+  mar = c(0, 0, 1, 0)
+)
+
+
+```
+
+
+## Correlation Chart
+
+```{r}
+# Step 1: Prepare correlation data (only numeric variables that exist in your dataset)
+corr_data <- model_data %>%
+  dplyr::select(
+    Log_Purchase = log_purchase,
+    Previous.Purchases,
+    Gender_numeric,
+    Age
+  ) %>%
+  mutate(across(everything(), ~ as.numeric(as.character(.)))) %>%
+  na.omit()
+
+# Step 2: Generate correlation matrix plot (with histograms and significance stars)
+chart.Correlation(
+  corr_data,
+  histogram = TRUE,
+  pch = 19,
+  col = "deeppink"
+)
+
+```
+
+
+## Advanced feature engineering function
+
+```{r}
+# Advanced feature engineering function
+engineer_features <- function(df) {
+  df <- df %>%
+    mutate(
+      # Age-based features
+      Age_Group = case_when(
+        Age < 25 ~ "Gen_Z",
+        Age >= 25 & Age < 35 ~ "Young_Millennial",
+        Age >= 35 & Age < 45 ~ "Old_Millennial",
+        Age >= 45 & Age < 55 ~ "Gen_X",
+        Age >= 55 & Age < 65 ~ "Young_Boomer",
+        Age >= 65 ~ "Senior"
+      ),
+      Age_Squared = Age^2,
+      Age_Log = log(Age + 1),
+      
+      # Seasonal features
+      Is_Holiday_Season = ifelse(Season %in% c("Fall", "Winter"), 1, 0),
+      Is_Summer = ifelse(Season == "Summer", 1, 0),
+      
+      # Purchase frequency numerical encoding
+      Purchase_Frequency_Score = case_when(
+        Frequency.of.Purchases == "Weekly" ~ 52,
+        Frequency.of.Purchases == "Bi-Weekly" ~ 26,
+        Frequency.of.Purchases == "Fortnightly" ~ 26,
+        Frequency.of.Purchases == "Monthly" ~ 12,
+        Frequency.of.Purchases == "Quarterly" ~ 4,
+        Frequency.of.Purchases == "Every 3 Months" ~ 4,
+        Frequency.of.Purchases == "Annually" ~ 1,
+        TRUE ~ 2
+      ),
+      
+      # Customer value metrics
+      Estimated_Annual_Value = Purchase.Amount..USD. * Purchase_Frequency_Score,
+      Purchase_per_Previous = ifelse(Previous.Purchases > 0, 
+                                    Purchase.Amount..USD. / Previous.Purchases, 
+                                    Purchase.Amount..USD.),
+      
+      # Review-based features
+      High_Satisfaction = ifelse(Review.Rating >= 4.0, 1, 0),
+      Low_Satisfaction = ifelse(Review.Rating < 3.0, 1, 0),
+      Review_Missing = ifelse(is.na(Review.Rating), 1, 0),
+      Review.Rating = ifelse(is.na(Review.Rating), median(Review.Rating, na.rm = TRUE), Review.Rating),
+      
+      # Promotional features
+      Uses_Discounts = as.numeric(Discount.Applied == "Yes" | Promo.Code.Used == "Yes"),
+      Both_Discounts = as.numeric(Discount.Applied == "Yes" & Promo.Code.Used == "Yes"),
+      
+      # Subscription interaction
+      Subscriber_Promo = ifelse(Subscription.Status == "Yes" & Promo.Code.Used == "Yes", 1, 0),
+      Subscriber_NoPromo = ifelse(Subscription.Status == "Yes" & Promo.Code.Used == "No", 1, 0),
+      
+      # Shipping features
+      Premium_Shipping = ifelse(Shipping.Type %in% c("Express", "Next Day Air"), 1, 0),
+      Standard_Shipping = ifelse(Shipping.Type == "Standard", 1, 0),
+      
+      # Color grouping
+      Color_Type = case_when(
+        Color %in% c("Black", "Gray", "Charcoal", "Silver") ~ "Neutral_Dark",
+        Color %in% c("White", "Beige", "Cream") ~ "Neutral_Light",
+        Color %in% c("Blue", "Navy", "Teal", "Turquoise") ~ "Blue_Family",
+        Color %in% c("Red", "Maroon", "Pink", "Magenta") ~ "Red_Family",
+        Color %in% c("Green", "Olive", "Cyan") ~ "Green_Family",
+        Color %in% c("Yellow", "Orange", "Gold", "Peach") ~ "Warm_Bright",
+        Color %in% c("Purple", "Lavender", "Violet", "Indigo") ~ "Purple_Family",
+        TRUE ~ "Other"
+      ),
+      
+      # Size features
+      Size_Category = case_when(
+        Size %in% c("XS", "S") ~ "Small",
+        Size == "M" ~ "Medium",
+        Size %in% c("L", "XL") ~ "Large",
+        TRUE ~ "Unknown"
+      ),
+      Is_Standard_Size = ifelse(Size %in% c("S", "M", "L"), 1, 0),
+      
+      # Payment method features
+      Digital_Payment = ifelse(Payment.Method %in% c("PayPal", "Venmo"), 1, 0),
+      Card_Payment = ifelse(Payment.Method %in% c("Credit Card", "Debit Card"), 1, 0),
+      
+      # Category-based features
+      Is_Clothing = ifelse(Category == "Clothing", 1, 0),
+      Is_Footwear = ifelse(Category == "Footwear", 1, 0),
+      Is_Outerwear = ifelse(Category == "Outerwear", 1, 0),
+      
+      # Customer engagement score
+      Engagement_Score = (as.numeric(Subscription.Status == "Yes") * 3 +
+                         as.numeric(Promo.Code.Used == "Yes") * 2 +
+                         as.numeric(Discount.Applied == "Yes") * 1 +
+                         Premium_Shipping * 2 +
+                         (Review.Rating - 3) * 0.5),
+      
+      # Purchase history categorization
+      Purchase_History_Category = case_when(
+        Previous.Purchases == 0 ~ "New_Customer",
+        Previous.Purchases >= 1 & Previous.Purchases <= 5 ~ "Occasional",
+        Previous.Purchases >= 6 & Previous.Purchases <= 15 ~ "Regular",
+        Previous.Purchases >= 16 & Previous.Purchases <= 30 ~ "Frequent",
+        Previous.Purchases > 30 ~ "VIP",
+        TRUE ~ "Unknown"
+      ),
+      
+      # Previous purchases features
+      Previous_Purchases_Log = log(Previous.Purchases + 1),
+      Previous_Purchases_Sqrt = sqrt(Previous.Purchases),
+      Is_New_Customer = ifelse(Previous.Purchases == 0, 1, 0),
+      Is_Returning_Customer = ifelse(Previous.Purchases > 0, 1, 0),
+      
+      # Location-based features (simplified for US states)
+      Region = case_when(
+        Location %in% c("California", "Oregon", "Washington", "Nevada", "Alaska", "Hawaii") ~ "West",
+        Location %in% c("Texas", "Florida", "Georgia", "North Carolina", "South Carolina", 
+                       "Virginia", "Tennessee", "Alabama", "Louisiana", "Mississippi") ~ "South",
+        Location %in% c("New York", "Pennsylvania", "Massachusetts", "Connecticut", 
+                       "New Jersey", "Maryland", "Maine", "Vermont", "New Hampshire") ~ "Northeast",
+        Location %in% c("Illinois", "Michigan", "Ohio", "Wisconsin", "Indiana", 
+                       "Minnesota", "Iowa", "Missouri", "Kansas", "Nebraska") ~ "Midwest",
+        TRUE ~ "Other"
+      ),
+      
+      # Average order value tier
+      AOV_Tier = case_when(
+        Purchase.Amount..USD. < 30 ~ "Low",
+        Purchase.Amount..USD. >= 30 & Purchase.Amount..USD. < 60 ~ "Medium",
+        Purchase.Amount..USD. >= 60 & Purchase.Amount..USD. < 100 ~ "High",
+        Purchase.Amount..USD. >= 100 ~ "Premium",
+        TRUE ~ "Medium"
+      )
+    )
+  
+  return(df)
+}
+
+# Apply feature engineering
+data_enhanced <- engineer_features(data)
+
+# Create interaction features
+create_interactions <- function(df) {
+  df <- df %>%
+    mutate(
+      # Key interactions
+      Gender_Age = paste(Gender, Age_Group, sep = "_"),
+      Category_Season = paste(Category, Season, sep = "_"),
+      Category_Gender = paste(Category, Gender, sep = "_"),
+      Payment_Shipping = paste(Payment.Method, Shipping.Type, sep = "_"),
+      Size_Gender = paste(Size_Category, Gender, sep = "_"),
+      
+      # Numerical interactions
+      Age_Previous = Age * Previous.Purchases,
+      Age_Frequency = Age * Purchase_Frequency_Score,
+      Previous_Frequency = Previous.Purchases * Purchase_Frequency_Score,
+      
+      # Discount behavior
+      Discount_Frequency = paste(Uses_Discounts, 
+                                case_when(
+                                  Purchase_Frequency_Score >= 26 ~ "High_Freq",
+                                  Purchase_Frequency_Score >= 4 ~ "Med_Freq",
+                                  TRUE ~ "Low_Freq"
+                                ), sep = "_")
+    )
+  
+  return(df)
+}
+
+data_enhanced <- create_interactions(data_enhanced)
+
+# Display feature summary
+cat("\nTotal features created:", ncol(data_enhanced) - ncol(data), "\n")
+cat("Total features available:", ncol(data_enhanced), "\n")
+```
+
+
+##  Data quality checks and preprocessing
+
+```{r}
+# Data quality checks and preprocessing
+preprocess_data <- function(df) {
+  # Handle missing values
+  cat("Handling missing values...\n")
+  
+  # For Review Rating, use predictive imputation
+  if (sum(is.na(df$Review.Rating)) > 0) {
+    # Simple median imputation (you can make this more sophisticated)
+    df$Review.Rating[is.na(df$Review.Rating)] <- median(df$Review.Rating, na.rm = TRUE)
+  }
+  
+  # Check for duplicates
+  cat("Checking for duplicates...\n")
+  n_duplicates <- sum(duplicated(df))
+  if (n_duplicates > 0) {
+    cat("Removing", n_duplicates, "duplicate rows\n")
+    df <- df[!duplicated(df), ]
+  }
+  
+  # Remove constant features
+  constant_features <- names(df)[sapply(df, function(x) length(unique(x)) == 1)]
+  if (length(constant_features) > 0) {
+    cat("Removing constant features:", paste(constant_features, collapse = ", "), "\n")
+    df <- df[, !names(df) %in% constant_features]
+  }
+  
+  return(df)
+}
+
+data_enhanced <- preprocess_data(data_enhanced)
+
+# Select features for modeling
+feature_cols <- names(data_enhanced)[!names(data_enhanced) %in% c("Customer.ID", "Item.Purchased")]
+data_model <- data_enhanced[, feature_cols]
+
+cat("\nFinal dataset shape:", dim(data_model), "\n")
+```
+
+
+## Create Splits
+
+```{r}
+# Stratified split function
+create_stratified_splits <- function(df, target_col = "Purchase.Amount..USD.", 
+                                   train_prop = 0.7, valid_prop = 0.15) {
+  set.seed(311441)
+  
+  # Create stratification variable based on target quantiles
+  n_strata <- 10
+  df$strata <- cut(df[[target_col]], 
+                   breaks = quantile(df[[target_col]], probs = seq(0, 1, length.out = n_strata + 1)),
+                   include.lowest = TRUE,
+                   labels = FALSE)
+  
+  # First split: train vs temp (valid + test)
+  train_idx <- createDataPartition(df$strata, p = train_prop, list = FALSE)
+  train_data <- df[train_idx, ]
+  temp_data <- df[-train_idx, ]
+  
+  # Second split: valid vs test
+  valid_prop_adjusted <- valid_prop / (1 - train_prop)
+  valid_idx <- createDataPartition(temp_data$strata, p = valid_prop_adjusted, list = FALSE)
+  valid_data <- temp_data[valid_idx, ]
+  test_data <- temp_data[-valid_idx, ]
+  
+  # Remove strata column
+  train_data$strata <- NULL
+  valid_data$strata <- NULL
+  test_data$strata <- NULL
+  
+  # Print split information
+  cat("Data split summary:\n")
+  cat("Train set:", nrow(train_data), "rows (", 
+      round(nrow(train_data)/nrow(df)*100, 1), "%)\n")
+  cat("Valid set:", nrow(valid_data), "rows (", 
+      round(nrow(valid_data)/nrow(df)*100, 1), "%)\n")
+  cat("Test set:", nrow(test_data), "rows (", 
+      round(nrow(test_data)/nrow(df)*100, 1), "%)\n")
+  
+  return(list(train = train_data, valid = valid_data, test = test_data))
+}
+
+# Create splits
+splits <- create_stratified_splits(data_model)
+train <- splits$train
+valid <- splits$valid
+test <- splits$test
+
+# Verify target distribution across splits
+cat("\nTarget distribution verification:\n")
+cat("Train mean:", mean(train$Purchase.Amount..USD.), "SD:", sd(train$Purchase.Amount..USD.), "\n")
+cat("Valid mean:", mean(valid$Purchase.Amount..USD.), "SD:", sd(valid$Purchase.Amount..USD.), "\n")
+cat("Test mean:", mean(test$Purchase.Amount..USD.), "SD:", sd(test$Purchase.Amount..USD.), "\n")
+```
+
+
+## Build LM Model
+
+```{r build-lm-model}
+data$log_purchase <- log(data$Purchase.Amount..USD.)
+
+try({
+  lm_model <- lm(
+    log_purchase ~ Promo.Code.Used * Shipping.Type +
+      Discount.Applied + Previous.Purchases +
+      Age + Gender_numeric,
+    data = model_data
+  )
+  message("lm_model created successfully.")
+}, silent = FALSE)
+```
+
+
+## Sanity Check
+
+```{r sanity-check}
+str(model_data)
+summary(model_data)
+```
+
+
+## LM Model Diagnostics
+
+```{r lm-model-diagnostics}
+
+if (exists("lm_model")) {
+  par(mfrow = c(2, 2))
+  plot(lm_model)
+  par(mfrow = c(1, 1))
+} else {
+  message("lm_model does not exist. Please check model creation.")
+}
+
+# Plot 1: Residuals vs Fitted
+plot(lm_model$fitted.values, resid(lm_model),
+     col = "lightblue2", pch = 16,
+     main = "Residuals vs Fitted",
+     xlab = "Fitted values",
+     ylab = "Residuals")
+abline(h = 0, col = "pink", lwd = 2)
+
+# Plot 2: Normal Q-Q
+qqnorm(rstandard(lm_model),
+       main = "Q-Q Residuals",
+       col = "violet", pch = 16)
+qqline(rstandard(lm_model), col = "skyblue", lwd = 2)
+
+# Plot 3: Scale-Location
+plot(lm_model$fitted.values, sqrt(abs(rstandard(lm_model))),
+     col = "lightcoral", pch = 16,
+     main = "Scale-Location",
+     xlab = "Fitted values",
+     ylab = "√|Standardized residuals|")
+abline(h = mean(sqrt(abs(rstandard(lm_model)))), col = "lightblue", lwd = 2)
+
+# Plot 4: Residuals vs Leverage
+plot(lm_model, which = 5, col = "lightpink", pch = 16)
+
+# Reset layout
+par(mfrow = c(1, 1))
+```
+
+
+## Prepare data for XGBoost
+
+```{r}
+# Prepare data for XGBoost
+prepare_xgb_data <- function(df, target_col = "Purchase.Amount..USD.", is_train = TRUE) {
+  # Separate features and target
+  if (target_col %in% names(df)) {
+    features <- df[, !names(df) %in% target_col]
+    target <- df[[target_col]]
+  } else {
+    features <- df
+    target <- NULL
+  }
+  
+  # Convert character columns to factors then to numeric
+  char_cols <- names(features)[sapply(features, is.character)]
+  
+  for (col in char_cols) {
+    features[[col]] <- as.numeric(as.factor(features[[col]]))
+  }
+  
+  # Convert logical columns to numeric
+  logical_cols <- names(features)[sapply(features, is.logical)]
+  for (col in logical_cols) {
+    features[[col]] <- as.numeric(features[[col]])
+  }
+  
+  # Create matrix
+  feature_matrix <- as.matrix(features)
+  
+  if (!is.null(target)) {
+    return(list(features = feature_matrix, target = target))
+  } else {
+    return(feature_matrix)
+  }
+}
+
+# Prepare datasets
+train_xgb <- prepare_xgb_data(train)
+valid_xgb <- prepare_xgb_data(valid)
+test_xgb <- prepare_xgb_data(test)
+
+# Create DMatrix objects
+dtrain <- xgb.DMatrix(data = train_xgb$features, label = train_xgb$target)
+dvalid <- xgb.DMatrix(data = valid_xgb$features, label = valid_xgb$target)
+dtest <- xgb.DMatrix(data = test_xgb$features, label = test_xgb$target)
+
+# XGBoost with extensive hyperparameter tuning
+cat("\n=== Training XGBoost Model ===\n")
+
+# Define parameter grid
+xgb_params_grid <- list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eval_metric = c("rmse", "mae"),
+  max_depth = c(6, 8, 10),
+  min_child_weight = c(1, 3, 5),
+  subsample = c(0.7, 0.8, 0.9),
+  colsample_bytree = c(0.7, 0.8, 0.9),
+  eta = c(0.01, 0.03, 0.05),
+  gamma = c(0, 0.1, 0.2),
+  lambda = c(1, 2, 3),
+  alpha = c(0, 0.5, 1)
+)
+
+# Random search for hyperparameter optimization
+set.seed(311441)
+n_random_searches <- 20
+best_rmse <- Inf
+best_params <- NULL
+
+for (i in 1:n_random_searches) {
+  # Sample random parameters
+  params <- list(
+    booster = "gbtree",
+    objective = "reg:squarederror",
+    eval_metric = "rmse",
+    max_depth = sample(xgb_params_grid$max_depth, 1),
+    min_child_weight = sample(xgb_params_grid$min_child_weight, 1),
+    subsample = sample(xgb_params_grid$subsample, 1),
+    colsample_bytree = sample(xgb_params_grid$colsample_bytree, 1),
+    eta = sample(xgb_params_grid$eta, 1),
+    gamma = sample(xgb_params_grid$gamma, 1),
+    lambda = sample(xgb_params_grid$lambda, 1),
+    alpha = sample(xgb_params_grid$alpha, 1)
+  )
+  
+  # Train model with early stopping
+  xgb_cv <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 1000,
+    nfold = 5,
+    early_stopping_rounds = 50,
+    verbose = 0
+  )
+  
+  # Check if this is the best model
+  min_rmse <- min(xgb_cv$evaluation_log$test_rmse_mean)
+  if (min_rmse < best_rmse) {
+    best_rmse <- min_rmse
+    best_params <- params
+    best_nrounds <- xgb_cv$best_iteration
+  }
+  
+  if (i %% 5 == 0) {
+    cat("Progress:", i, "/", n_random_searches, "searches completed. Best RMSE:", best_rmse, "\n")
+  }
+}
+
+cat("\nBest parameters found:\n")
+print(best_params)
+cat("Best nrounds:", best_nrounds, "\n")
+
+# Train final model with best parameters
+xgb_final <- xgb.train(
+  params = best_params,
+  data = dtrain,
+  nrounds = best_nrounds,
+  watchlist = list(train = dtrain, valid = dvalid),
+  early_stopping_rounds = 50,
+  verbose = 1,
+  print_every_n = 50
+)
+
+# Make predictions
+xgb_pred_train <- predict(xgb_final, dtrain)
+xgb_pred_valid <- predict(xgb_final, dvalid)
+xgb_pred_test <- predict(xgb_final, dtest)
+
+# Evaluate performance
+cat("\n=== XGBoost Performance ===\n")
+cat("Train set:\n")
+print(evaluate_model(train$Purchase.Amount..USD., xgb_pred_train))
+cat("\nValidation set:\n")
+print(evaluate_model(valid$Purchase.Amount..USD., xgb_pred_valid))
+cat("\nTest set:\n")
+xgb_test_results <- evaluate_model(test$Purchase.Amount..USD., xgb_pred_test)
+print(xgb_test_results)
+
+# Feature importance
+importance_matrix <- xgb.importance(model = xgb_final)
+xgb.plot.importance(importance_matrix[1:20,])
+```
+
+
+## Training Random Forest with Ranger
+
+```{r}
+# Use ranger for faster Random Forest
+cat("\n=== Training Random Forest with Ranger ===\n")
+
+# Ranger can handle factors directly, so prepare data differently
+prepare_ranger_data <- function(df) {
+  # Convert character columns to factors
+  char_cols <- names(df)[sapply(df, is.character)]
+  for (col in char_cols) {
+    df[[col]] <- as.factor(df[[col]])
+  }
+  return(df)
+}
+
+train_rf <- prepare_ranger_data(train)
+valid_rf <- prepare_ranger_data(valid)
+test_rf <- prepare_ranger_data(test)
+
+# Hyperparameter tuning for ranger
+rf_grid <- expand.grid(
+  num.trees = c(500, 1000),
+  mtry = c(10, 15, 20, 25),
+  min.node.size = c(5, 10, 20),
+  max.depth = c(0, 10, 20)  # 0 means no limit
+)
+
+# Use a subset for faster tuning
+rf_grid_sample <- rf_grid[sample(nrow(rf_grid), 10), ]
+
+best_rf_rmse <- Inf
+best_rf_params <- NULL
+
+for (i in 1:nrow(rf_grid_sample)) {
+  params <- rf_grid_sample[i, ]
+  
+  rf_model <- ranger(
+    Purchase.Amount..USD. ~ .,
+    data = train_rf,
+    num.trees = params$num.trees,
+    mtry = params$mtry,
+    min.node.size = params$min.node.size,
+    max.depth = if(params$max.depth == 0) NULL else params$max.depth,
+    importance = "impurity",
+    num.threads = parallel::detectCores() - 1,
+    verbose = FALSE
+  )
+  
+  # Validate
+  rf_pred_valid <- predict(rf_model, valid_rf)$predictions
+  rmse <- sqrt(mean((valid_rf$Purchase.Amount..USD. - rf_pred_valid)^2))
+  
+  if (rmse < best_rf_rmse) {
+    best_rf_rmse <- rmse
+    best_rf_params <- params
+  }
+  
+  cat("RF Grid search", i, "/", nrow(rf_grid_sample), "- RMSE:", rmse, "\n")
+}
+
+# Train final RF model
+cat("\nTraining final Random Forest model...\n")
+rf_final <- ranger(
+  Purchase.Amount..USD. ~ .,
+  data = train_rf,
+  num.trees = best_rf_params$num.trees,
+  mtry = best_rf_params$mtry,
+  min.node.size = best_rf_params$min.node.size,
+  max.depth = if(best_rf_params$max.depth == 0) NULL else best_rf_params$max.depth,
+  importance = "impurity",
+  num.threads = parallel::detectCores() - 1,
+  verbose = TRUE
+)
+
+# Predictions
+rf_pred_test <- predict(rf_final, test_rf)$predictions
+rf_test_results <- evaluate_model(test$Purchase.Amount..USD., rf_pred_test)
+
+cat("\n=== Random Forest Performance ===\n")
+print(rf_test_results)
+
+# Variable importance
+rf_importance <- importance(rf_final)
+rf_imp_df <- data.frame(
+  Variable = names(rf_importance),
+  Importance = rf_importance
+) %>%
+  arrange(desc(Importance))
+
+# Plot top 20 important variables
+barplot(rf_imp_df$Importance[20:1], 
+        names.arg = rf_imp_df$Variable[20:1], 
+        horiz = TRUE, las = 1,
+        main = "Top 20 Important Variables - Random Forest",
+        xlab = "Importance", cex.names = 0.7)
+```
+
+
+## Training Gradient Boosting Machine
+
+```{r}
+# Train GBM model
+cat("\n=== Training Gradient Boosting Machine ===\n")
+
+# Prepare data for GBM (needs numeric data)
+train_gbm <- train
+valid_gbm <- valid
+test_gbm <- test
+
+# Convert factors to numeric
+factor_cols <- names(train_gbm)[sapply(train_gbm, is.factor)]
+for (col in factor_cols) {
+  train_gbm[[col]] <- as.numeric(train_gbm[[col]])
+  valid_gbm[[col]] <- as.numeric(valid_gbm[[col]])
+  test_gbm[[col]] <- as.numeric(test_gbm[[col]])
+}
+
+# Convert characters to numeric
+char_cols <- names(train_gbm)[sapply(train_gbm, is.character)]
+for (col in char_cols) {
+  all_levels <- unique(c(train_gbm[[col]], valid_gbm[[col]], test_gbm[[col]]))
+  train_gbm[[col]] <- match(train_gbm[[col]], all_levels)
+  valid_gbm[[col]] <- match(valid_gbm[[col]], all_levels)
+  test_gbm[[col]] <- match(test_gbm[[col]], all_levels)
+}
+
+# GBM hyperparameter tuning
+gbm_grid <- expand.grid(
+  n.trees = c(500, 1000),
+  interaction.depth = c(5, 7, 9),
+  shrinkage = c(0.01, 0.05),
+  n.minobsinnode = c(10, 20)
+)
+
+# Train control
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = TRUE
+)
+
+# Train GBM with caret
+set.seed(311441)
+gbm_model <- train(
+  Purchase.Amount..USD. ~ .,
+  data = train_gbm,
+  method = "gbm",
+  trControl = ctrl,
+  tuneGrid = gbm_grid,
+  verbose = FALSE
+)
+
+# Best model
+cat("\nBest GBM parameters:\n")
+print(gbm_model$bestTune)
+
+# Predictions
+gbm_pred_test <- predict(gbm_model, test_gbm)
+gbm_test_results <- evaluate_model(test$Purchase.Amount..USD., gbm_pred_test)
+
+cat("\n=== GBM Performance ===\n")
+print(gbm_test_results)
+```
+
+
+## Creating Model Ensemble
+
+```{r}
+# Create ensemble predictions
+cat("\n=== Creating Model Ensemble ===\n")
+
+# Collect all predictions
+ensemble_preds <- data.frame(
+  actual = test$Purchase.Amount..USD.,
+  xgb = xgb_pred_test,
+  rf = rf_pred_test,
+  gbm = gbm_pred_test
+)
+
+# Simple average ensemble
+ensemble_preds$avg <- rowMeans(ensemble_preds[, c("xgb", "rf", "gbm")])
+avg_results <- evaluate_model(ensemble_preds$actual, ensemble_preds$avg)
+
+cat("\nSimple Average Ensemble:\n")
+print(avg_results)
+
+# Weighted ensemble based on validation performance
+# Calculate weights based on validation R²
+xgb_valid_r2 <- evaluate_model(valid$Purchase.Amount..USD., xgb_pred_valid)$R2
+rf_valid_r2 <- evaluate_model(valid$Purchase.Amount..USD., 
+                             predict(rf_final, valid_rf)$predictions)$R2
+gbm_valid_r2 <- evaluate_model(valid$Purchase.Amount..USD., 
+                              predict(gbm_model, valid_gbm))$R2
+
+# Normalize weights
+weights <- c(xgb_valid_r2, rf_valid_r2, gbm_valid_r2)
+weights <- weights / sum(weights)
+
+cat("\nModel weights based on validation R²:\n")
+cat("XGBoost:", round(weights[1], 3), "\n")
+cat("Random Forest:", round(weights[2], 3), "\n")
+cat("GBM:", round(weights[3], 3), "\n")
+
+# Weighted predictions
+ensemble_preds$weighted <- weights[1] * ensemble_preds$xgb + 
+                          weights[2] * ensemble_preds$rf + 
+                          weights[3] * ensemble_preds$gbm
+
+weighted_results <- evaluate_model(ensemble_preds$actual, ensemble_preds$weighted)
+
+cat("\nWeighted Ensemble:\n")
+print(weighted_results)
+
+# Stacking with linear model
+stack_train <- data.frame(
+  xgb = xgb_pred_valid,
+  rf = predict(rf_final, valid_rf)$predictions,
+  gbm = predict(gbm_model, valid_gbm),
+  actual = valid$Purchase.Amount..USD.
+)
+
+# Train meta-model
+meta_model <- lm(actual ~ xgb + rf + gbm, data = stack_train)
+summary(meta_model)
+
+# Stacked predictions
+ensemble_preds$stacked <- predict(meta_model, 
+                                 newdata = ensemble_preds[, c("xgb", "rf", "gbm")])
+stacked_results <- evaluate_model(ensemble_preds$actual, ensemble_preds$stacked)
+
+cat("\nStacked Ensemble:\n")
+print(stacked_results)
+```
+
+
+## Comprehensive Model Comparison & Visualization
+
+
+```{r}
+# --- Comprehensive Model Comparison & Visualization ---
+
+# === FINAL MODEL COMPARISON ===
+cat("\n=== FINAL MODEL COMPARISON ===\n")
+
+# 1. Create performance summary
+model_comparison <- data.frame(
+  Model = c("XGBoost", "Random Forest", "GBM", 
+            "Simple Average", "Weighted Average", "Stacked"),
+  RMSE = c(xgb_test_results$RMSE, rf_test_results$RMSE, gbm_test_results$RMSE,
+           avg_results$RMSE, weighted_results$RMSE, stacked_results$RMSE),
+  MAE = c(xgb_test_results$MAE, rf_test_results$MAE, gbm_test_results$MAE,
+          avg_results$MAE, weighted_results$MAE, stacked_results$MAE),
+  R2 = c(xgb_test_results$R2, rf_test_results$R2, gbm_test_results$R2,
+         avg_results$R2, weighted_results$R2, stacked_results$R2),
+  MAPE = c(xgb_test_results$MAPE, rf_test_results$MAPE, gbm_test_results$MAPE,
+           avg_results$MAPE, weighted_results$MAPE, stacked_results$MAPE)
+)
+
+# 2. Sort by highest R²
+model_comparison <- model_comparison[order(model_comparison$R2, decreasing = TRUE), ]
+print(model_comparison)
+
+# 3. Plot performance metrics
+par(mfrow = c(3, 2))  # Layout: 3 rows × 2 columns
+
+barplot(model_comparison$R2,
+        names.arg = model_comparison$Model,
+        main = "Model R² Comparison",
+        ylab = "R²", col = "lightblue",
+        las = 2, cex.names = 0.8)
+
+barplot(model_comparison$RMSE,
+        names.arg = model_comparison$Model,
+        main = "Model RMSE Comparison",
+        ylab = "RMSE", col = "lightcoral",
+        las = 2, cex.names = 0.8)
+
+barplot(model_comparison$MAE,
+        names.arg = model_comparison$Model,
+        main = "Model MAE Comparison",
+        ylab = "MAE", col = "lightgreen",
+        las = 2, cex.names = 0.8)
+
+barplot(model_comparison$MAPE,
+        names.arg = model_comparison$Model,
+        main = "Model MAPE Comparison",
+        ylab = "MAPE", col = "lightgoldenrod1",
+        las = 2, cex.names = 0.8)
+
+# 4. Actual vs Predicted for Best Model
+model_column_map <- list(
+  "XGBoost" = "xgboost",
+  "Random Forest" = "random_forest",
+  "GBM" = "gbm",
+  "Simple Average" = "simple_avg",
+  "Weighted Average" = "weighted_avg",
+  "Stacked" = "stacked"
+)
+
+best_model <- model_comparison$Model[1]
+best_column <- model_column_map[[best_model]]
+
+if (!is.null(best_column) && best_column %in% names(ensemble_preds)) {
+  best_predictions <- ensemble_preds[[best_column]]
+
+  if (!all(is.na(best_predictions))) {
+    plot(ensemble_preds$actual, best_predictions,
+         main = paste("Actual vs Predicted -", best_model),
+         xlab = "Actual", ylab = "Predicted",
+         pch = 20, col = alpha("lightblue", 0.5))
+    abline(0, 1, col = "lightpink", lwd = 2)
+
+    # 5. Residual Plot
+    residuals <- ensemble_preds$actual - best_predictions
+    plot(best_predictions, residuals,
+         main = paste("Residual Plot -", best_model),
+         xlab = "Predicted", ylab = "Residuals",
+         pch = 20, col = alpha("lightblue", 0.5))
+    abline(h = 0, col = "lightpink", lwd = 2)
+  } else {
+    warning("Best predictions are all NA — skipping prediction plots.")
+  }
+} else {
+  warning("Best model predictions not found in ensemble_preds — skipping plots.")
+}
+
+par(mfrow = c(1, 1))  # Reset layout
+
+# 6. Feature Importance
+cat("\n=== Top 10 Most Important Features ===\n")
+cat("\nXGBoost top features:\n")
+print(importance_matrix[1:10, c("Feature", "Gain")])
+
+cat("\nRandom Forest top features:\n")
+print(rf_imp_df[1:10, ])
+
+# 7. Save Final Models
+cat("\n=== Saving Models ===\n")
+if (!dir.exists("models")) {
+  dir.create("models", recursive = TRUE)
+  cat("Created 'models' directory\n")
+}
+
+saveRDS(xgb_final, "models/best_xgboost_model.rds")
+saveRDS(rf_final, "models/best_ranger_model.rds")
+saveRDS(gbm_model, "models/best_gbm_model.rds")
+saveRDS(meta_model, "models/meta_model.rds")
+saveRDS(model_comparison, "models/model_comparison.rds")
+
+cat("\nModels saved successfully!\n")
+cat("\nBest performing model:", best_model,
+    "with R² =", round(model_comparison$R2[1], 4), "\n")
+
+```
+
+
+## Coefficient Plot with Confidence Intervals
+
+```{r}
+library(broom)
+library(ggplot2)
+
+model_data$FastShipping <- ifelse(model_data$Shipping.Type %in% c("Next Day", "Express"), 1, 0)
+model_data$Promo.Code.Used <- as.numeric(model_data$Promo.Code.Used)
+model_data$Previous.Purchases <- as.numeric(model_data$Previous.Purchases)
+
+model <- lm(Purchase.Amount..USD. ~ Promo.Code.Used * FastShipping + Previous.Purchases + Age, data = model_data)
+
+model_tidy <- tidy(model)
+
+ggplot(model_tidy, aes(x = term, y = estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = estimate - 1.96*std.error, ymax = estimate + 1.96*std.error), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  labs(title = "Coefficient Estimates with 95% Confidence Intervals",
+       x = "Variables", y = "Estimate") +
+  theme_minimal()
+
+```
+
+
+## Linear Regression: Fast Shipping & Promo Code Used
+
+```{r}
+# Ensure necessary columns exist
+if (!("Promo.Code.Used" %in% names(model_data)) | !("Shipping.Type" %in% names(model_data))) {
+  stop("Missing required columns in the dataset.")
+}
+
+# Step 1: Create FastShipping dummy (1 if Express or Next Day Air, 0 if Standard or NA)
+model_data$FastShipping <- ifelse(model_data$Shipping.Type %in% c("Express", "Next Day Air"), 1, 0)
+
+# Step 2: Ensure Promo.Code.Used is numeric
+model_data$Promo.Code.Used <- as.numeric(model_data$Promo.Code.Used)
+
+# Step 3: Fit interaction model using raw purchase amount (or use log if appropriate)
+interaction_model <- lm(Purchase.Amount..USD. ~ Promo.Code.Used * FastShipping + Previous.Purchases + Age, data = model_data)
+
+# Step 4: Print model summary
+summary(interaction_model)
+```
+
+
+## SHAP Regression
+
+```{r}
+# Step 1: Prepare model_data with FastShipping variable
+model_data$FastShipping <- ifelse(model_data$Shipping.Type %in% c("Next Day", "Express"), 1, 0)
+model_data$Promo.Code.Used <- as.numeric(model_data$Promo.Code.Used)
+model_data$Previous.Purchases <- as.numeric(model_data$Previous.Purchases)
+
+# Step 2: One-hot encode categorical variables (excluding target and FastShipping)
+library(caret)
+dummies <- dummyVars(Purchase.Amount..USD. ~ .,
+                     data = model_data[, !(names(model_data) %in% c("log_purchase"))])
+x_df <- predict(dummies, newdata = model_data)
+x_df <- as.data.frame(x_df)
+
+# Step 3: Add FastShipping back into x_df if it was dropped
+if (!"FastShipping" %in% colnames(x_df)) {
+  x_df$FastShipping <- model_data$FastShipping
+}
+
+# Step 4: Create the target variable
+y <- model_data$log_purchase
+
+# Step 5: Final NA check
+if (anyNA(x_df) | anyNA(y)) {
+  stop("Missing values found in features or target variable. Please check preprocessing.")
+}
+
+# Step 6: Train XGBoost model
+library(xgboost)
+x_matrix <- as.matrix(x_df)
+xgb_model <- xgboost(
+  data = x_matrix,
+  label = y,
+  nrounds = 100,
+  objective = "reg:squarederror",
+  verbose = 0
+)
+
+# Step 7: Define custom prediction function
+predict_xgb <- function(model, newdata) {
+  newdata <- as.data.frame(newdata)
+  for (col in setdiff(colnames(x_df), colnames(newdata))) {
+    newdata[[col]] <- mean(x_df[[col]], na.rm = TRUE)
+  }
+  newdata <- newdata[, colnames(x_df), drop = FALSE]
+  newdata_matrix <- as.matrix(newdata)
+  colnames(newdata_matrix) <- colnames(x_df)
+  predict(model, newdata_matrix)
+}
+
+# Step 8: SHAP analysis setup
+library(iml)
+predictor <- Predictor$new(
+  model = xgb_model,
+  data = x_df,
+  y = y,
+  predict.function = predict_xgb
+)
+
+# Step 9: Create and plot SHAP interaction PDP
+interaction_effect <- FeatureEffect$new(
+  predictor,
+  feature = c("Promo.Code.Used", "FastShipping"),
+  method = "pdp"
+)
+
+plot(interaction_effect)
+
+```
+
+
+## A second SHAP Regression
+
+```{r}
+# Load libraries
+library(xgboost)
+library(SHAPforxgboost)
+library(dplyr)
+
+# Step 1: Prepare the data
+model_data_clean <- model_data %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  mutate(across(where(is.factor), as.numeric)) %>%
+  as.data.frame()
+
+# Step 2: Define outcome and predictors
+y <- model_data_clean$log_purchase
+x_df <- model_data_clean %>% dplyr::select(-log_purchase)
+
+# Step 3: Train XGBoost model
+x_matrix <- as.matrix(x_df)
+xgb_model <- xgboost(
+  data = x_matrix,
+  label = y,
+  nrounds = 100,
+  objective = "reg:squarederror",
+  verbose = 0
+)
+
+# Step 4: Compute SHAP values and convert to long format
+shap_values <- shap.values(xgb_model = xgb_model, X_train = x_matrix)
+shap_long <- shap.prep(xgb_model = xgb_model, X_train = x_matrix)
+
+# Step 5: Plot SHAP dependence between Promo.Code.Used and FastShipping
+shap.plot.dependence(
+  data_long = shap_long,
+  x = "Promo.Code.Used",
+  y = "FastShipping",
+  color_feature = "FastShipping"
+) +
+  scale_color_viridis_c(option = "C", direction = -1) +
+  theme_minimal(base_family = "Helvetica") +
+  labs(
+    title = "SHAP Dependence Plot",
+    x = "Promo Code Used",
+    y = "SHAP Value for FastShipping",
+    color = "Fast Shipping"
+  ) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+
+
+```
+
+
+## A further deepdive using ggplot
+
+```{r}
+# Check frequency counts for each variable
+table(model_data$Promo.Code.Used)
+table(model_data$FastShipping)
+
+# Create a cross-tabulation of the two variables
+cross_tab <- table(Promo.Code.Used = model_data$Promo.Code.Used,
+                   FastShipping = model_data$FastShipping)
+print(cross_tab)
+
+# Optional: Visualize with a bar plot
+library(ggplot2)
+
+ggplot(model_data, aes(x = factor(Promo.Code.Used), fill = factor(FastShipping))) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("#1f78b4", "lightpink3"), labels = c("Standard", "Fast")) +
+  labs(
+    title = "Promo Code Usage by Shipping Type",
+    x = "Promo Code Used",
+    y = "Count",
+    fill = "Shipping Type"
+  ) +
+  theme_minimal(base_family = "Helvetica") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text = element_text(size = 11)
+  )
+
+```
+
+
+## A second deepdive using ggplot
+
+```{r}
+# Load required libraries
+library(ggplot2)
+library(dplyr)
+
+# Step 1: Fit a linear model with interaction
+model <- lm(Purchase.Amount..USD. ~ Promo.Code.Used * FastShipping + Previous.Purchases + Age, data = model_data)
+
+# Step 2: Predict purchase amounts using the model
+model_data$Predicted <- predict(model)
+
+# Step 3: Calculate average predicted purchase for each combination of promo and shipping
+avg_predictions <- model_data %>%
+  group_by(Promo.Code.Used, FastShipping) %>%
+  summarise(MeanPurchase = mean(Predicted), .groups = "drop")
+
+# Step 4: Plot the results
+ggplot(avg_predictions, aes(x = factor(Promo.Code.Used), y = MeanPurchase, fill = factor(FastShipping))) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("#1f78b4", "lightpink3"), labels = c("Standard", "Fast")) +
+  labs(
+    title = "Predicted Purchase Amount by Promo Code and Shipping Type",
+    x = "Promo Code Used",
+    y = "Predicted Purchase Amount",
+    fill = "Shipping Type"
+  ) +
+  theme_minimal(base_family = "Helvetica") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text = element_text(size = 11)
+  )
+```
